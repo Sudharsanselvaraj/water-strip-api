@@ -13,9 +13,12 @@ async def predict(file: UploadFile = File(...)):
             temp_file.write(contents)
             temp_path = temp_file.name
 
-        patches = process_image(temp_path)
-        results = predict_all(patches)  # Calls your existing prediction logic for all parameters
+        patches, debug_img_b64 = process_image(temp_path)
+        results = predict_all(patches)
 
-        return JSONResponse(content={"predictions": results})
+        return JSONResponse(content={
+            "predictions": results,
+            "debug_image": debug_img_b64
+        })
     except Exception as e:
         return JSONResponse(content={"error": str(e)}, status_code=500)
