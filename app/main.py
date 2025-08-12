@@ -41,11 +41,15 @@ async def analyze(file: UploadFile = File(...)):
         debug_path = os.path.join(DEBUG_DIR, filename)
         debug_img.save(debug_path, format="JPEG", quality=85)
 
+        # Return full absolute URL
+        base_url = "https://water-strip-api.onrender.com"
+        debug_url = f"{base_url}/debug/{filename}"
+
         return JSONResponse(content={
             "status": "success",
             "timestamp": datetime.now().strftime("%Y-%m-%d %I:%M %p"),
             "predictions": results,
-            "debug_image_url": f"/debug/{filename}"
+            "debug_image_url": debug_url
         })
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Processing failed: {e}")
