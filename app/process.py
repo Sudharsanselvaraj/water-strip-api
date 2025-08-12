@@ -49,13 +49,37 @@ def preprocess_for_model_cv(img_bgr):
     return np.expand_dims(arr, axis=0)
 
 # ------------------------
-# Equal-split pad detection (consistent crops)
+# Improved equal-split pad detection
 # ------------------------
 def find_color_patches_equal_split(img_bgr, expected_pads=len(PARAM_ORDER)):
-    """Split image evenly into vertical sections for pad cropping."""
+    """
+    Detect strip area, crop margins, and split evenly into expected_pads sections.
+    """
     h, w = img_bgr.shape[:2]
-    box_w = w // expected_pads
-    return [(i * box_w, 0, box_w, h) for i in range(expected_pads)]
+
+    # Convert to grayscale for strip detection
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, thresh = cv2.threshold(blur, 200, 255, cv2.THRESH_BINARY_INV)
+
+    # Find largest contour (the strip)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        x, y, ww, hh = cv2.boundingRect(max(contours, key=cv2.contourArea))
+        # Crop to strip area
+        strip_img = img_bgr[y:y+hh, x:x+ww]
+        strip_x_offset = x
+        strip_h, strip_w = strip_img.shape[:2]
+    else:
+        # If no contour, fallback to full image
+        strip_img = img_bgr
+        strip_x_offset = 0
+        strip_h, strip_w = h, w
+
+    # Equal-split inside cropped strip
+    box_w = strip_w // expected_pads
+    boxes = [(strip_x_offset + i * box_w, 0, box_w, h) for i in range(expected_pads)]
+    return boxes
 
 # ------------------------
 # Crop with padding
@@ -97,7 +121,7 @@ def predict_from_pil_image(pil_img):
     img_np = np.array(pil_img)
     img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
 
-    # Always use equal split for consistent crops
+    # Use improved equal split for consistent crops
     boxes = find_color_patches_equal_split(img_bgr, expected_pads=len(PARAM_ORDER))
 
     annotated_pil = pil_img.copy()
@@ -115,7 +139,7 @@ def predict_from_pil_image(pil_img):
         if model is not None:
             try:
                 inp = preprocess_for_model_cv(crop)
-                pred_val = float(model.predict(inp, verbose=0)[0][0])  # Direct output, no scaler
+                pred_val = float(model.predict(inp, verbose=0)[0][0])  # Direct output
             except Exception as e:
                 print(f"Prediction failed for {param}: {e}")
                 pred_val = None
