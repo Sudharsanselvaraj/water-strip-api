@@ -3,7 +3,40 @@ import cv2
 import numpy as np
 import tensorflow as tf
 from PIL import Image, ImageDraw, ImageFont
-from app.utils import pil_to_bytes, bytes_to_base64
+import base64
+import io
+
+from app.utils import pil_to_bytes, bytes_to_base64  # If you keep these utils separately, else see below
+
+# ------------------------
+# Utility functions (if not imported from app.utils)
+# ------------------------
+def pil_to_bytes(pil_img, fmt="JPEG", quality=85):
+    bio = io.BytesIO()
+    pil_img.save(bio, format=fmt, quality=quality)
+    bio.seek(0)
+    return bio.read()
+
+def bytes_to_base64(b: bytes) -> str:
+    return base64.b64encode(b).decode("utf-8")
+
+# ------------------------
+# Denormalize function to convert normalized model output to real-world value
+# ------------------------
+def denormalize(param, normalized_val):
+    ranges = {
+        "Nitrate": (0, 250),       # ppm
+        "Nitrite": (0, 10),
+        "Chlorine": (0, 3.0),
+        "Hardness": (0, 300),
+        "Carbonate": (0, 300),
+        "pH": (0, 14),
+    }
+    if param not in ranges or normalized_val is None:
+        return None
+    min_val, max_val = ranges[param]
+    real_val = normalized_val * (max_val - min_val) + min_val
+    return round(real_val, 3)
 
 # ------------------------
 # Model configuration
@@ -130,7 +163,7 @@ def classify_status(param, value):
     return "danger"
 
 # ------------------------
-# Prediction pipeline
+# Prediction pipeline (with denormalization)
 # ------------------------
 def predict_from_pil_image(pil_img):
     img_np = np.array(pil_img)
@@ -163,14 +196,17 @@ def predict_from_pil_image(pil_img):
                 print(f"Prediction failed for {param}: {e}")
                 pred_val = None
 
+        # Denormalize prediction to real value
+        real_val = denormalize(param, pred_val)
+
         key = param if param != "Hardness" else "Total Hardness"
         results[key] = {
-            "value": round(pred_val, 3) if pred_val is not None else None,
+            "value": real_val,
             "unit": "pH" if param.lower() == "ph" else "ppm",
-            "safety": classify_status(param, pred_val)
+            "safety": classify_status(param, real_val)
         }
 
-        # Draw bounding boxes + label
+        # Draw bounding boxes + label (with real value)
         draw.rectangle([(x, y), (x + ww, y + hh)], outline="lime", width=2)
         label = f"{param}: {results[key]['value']}"
         draw.text((x, max(0, y - 12)), label, fill="red", font=font)
