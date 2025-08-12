@@ -1,3 +1,4 @@
+# app/main.py
 import os
 import io
 import uuid
@@ -9,15 +10,13 @@ from PIL import Image
 
 from .process import predict_from_pil_image
 
-# Config
 DEBUG_DIR = os.path.join(os.getcwd(), "debug")
 os.makedirs(DEBUG_DIR, exist_ok=True)
 
 app = FastAPI(title="Water Strip Analyzer")
 
-# Serve debug images at /debug/<filename>
+# mount debug folder
 app.mount("/debug", StaticFiles(directory=DEBUG_DIR), name="debug")
-
 
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
@@ -47,6 +46,6 @@ async def analyze(file: UploadFile = File(...)):
             "predictions": results,
             "debug_image_url": f"/debug/{filename}"
         })
+
     except Exception as e:
-        # return more informative server error
         raise HTTPException(status_code=500, detail=f"Processing failed: {e}")
