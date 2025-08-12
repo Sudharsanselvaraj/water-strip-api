@@ -48,4 +48,5 @@ async def analyze(file: UploadFile = File(...)):
             "debug_image_url": f"/debug/{filename}"
         })
     except Exception as e:
+        # return more informative server error
         raise HTTPException(status_code=500, detail=f"Processing failed: {e}")
