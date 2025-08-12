@@ -7,6 +7,9 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 
+# Add pytz for timezone support
+import pytz
+
 # Import from app package
 from app.process import predict_from_pil_image
 
@@ -22,7 +25,7 @@ app.mount("/debug", StaticFiles(directory=DEBUG_DIR), name="debug")
 
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
-    """Analyze uploaded image and return predictions + debug image URL."""
+    """Analyze uploaded image and return predictions + debug image URL + overall quality."""
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Uploaded file must be an image")
 
@@ -33,8 +36,8 @@ async def analyze(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail=f"Cannot open image: {e}")
 
     try:
-        # Run prediction
-        results, debug_img = predict_from_pil_image(pil)
+        # Run prediction - now returns 4 values including overall quality info
+        results, debug_img, overall_quality, quality_description = predict_from_pil_image(pil)
 
         # Save debug image to disk
         filename = f"debug_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}.jpg"
@@ -45,10 +48,17 @@ async def analyze(file: UploadFile = File(...)):
         base_url = "https://water-strip-api.onrender.com"
         debug_url = f"{base_url}/debug/{filename}"
 
+        # Use timezone-aware timestamp (example: Asia/Kolkata)
+        tz = pytz.timezone("Asia/Kolkata")
+        now = datetime.now(tz)
+        timestamp_str = now.strftime("%Y-%m-%d %I:%M %p %Z")
+
         return JSONResponse(content={
             "status": "success",
-            "timestamp": datetime.now().strftime("%Y-%m-%d %I:%M %p"),
+            "timestamp": timestamp_str,
             "predictions": results,
+            "overall_quality": overall_quality,
+            "quality_description": quality_description,
             "debug_image_url": debug_url
         })
     except Exception as e:
