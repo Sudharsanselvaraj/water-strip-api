@@ -1,7 +1,6 @@
 import os
 import cv2
 import numpy as np
-import joblib
 from PIL import Image, ImageDraw, ImageFont
 import tensorflow as tf
 from app.utils import pil_to_bytes, bytes_to_base64
@@ -11,10 +10,17 @@ from app.utils import pil_to_bytes, bytes_to_base64
 # ------------------------
 MODEL_DIR = os.path.join(os.getcwd(), "models")
 PARAM_ORDER = ["Nitrate", "Nitrite", "Chlorine", "Hardness", "Carbonate", "pH"]
+EXPECTED_PADS = len(PARAM_ORDER)
 IMG_SIZE = (128, 128)
 
+# Tuned HSV detection parameters
+SAT_THRESHOLD = 15        # Lower to catch pale pads
+MIN_AREA_RATIO = 0.0003   # Smaller pads won't be missed
+PAD_HEIGHT_RATIO = 0.85   # Slightly larger crop vertically
+PAD_WIDTH_RATIO = 0.85    # Slightly larger crop horizontally
+
 # ------------------------
-# Helper: Find model file
+# Load models
 # ------------------------
 def _find_file_for_param(param, ext_list):
     for f in os.listdir(MODEL_DIR):
@@ -23,9 +29,6 @@ def _find_file_for_param(param, ext_list):
             return os.path.join(MODEL_DIR, f)
     return None
 
-# ------------------------
-# Load models
-# ------------------------
 models = {}
 for p in PARAM_ORDER:
     mfile = _find_file_for_param(p, [".h5", ".keras"])
@@ -49,42 +52,47 @@ def preprocess_for_model_cv(img_bgr):
     return np.expand_dims(arr, axis=0)
 
 # ------------------------
-# Improved equal-split pad detection
+# Pad detection (HSV + contour)
 # ------------------------
-def find_color_patches_equal_split(img_bgr, expected_pads=len(PARAM_ORDER)):
-    """
-    Detect strip area, crop margins, and split evenly into expected_pads sections.
-    """
+def find_color_patches(img_bgr, expected_pads=EXPECTED_PADS):
     h, w = img_bgr.shape[:2]
+    blur = cv2.GaussianBlur(img_bgr, (5, 5), 0)
+    hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
+    s_ch, v_ch = hsv[:, :, 1], hsv[:, :, 2]
 
-    # Convert to grayscale for strip detection
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    _, thresh = cv2.threshold(blur, 200, 255, cv2.THRESH_BINARY_INV)
+    sat_mask = (s_ch > SAT_THRESHOLD).astype(np.uint8) * 255
+    val_mask = (v_ch < 250).astype(np.uint8) * 255
+    mask = cv2.bitwise_and(sat_mask, val_mask)
 
-    # Find largest contour (the strip)
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if contours:
-        x, y, ww, hh = cv2.boundingRect(max(contours, key=cv2.contourArea))
-        # Crop to strip area
-        strip_img = img_bgr[y:y+hh, x:x+ww]
-        strip_x_offset = x
-        strip_h, strip_w = strip_img.shape[:2]
-    else:
-        # If no contour, fallback to full image
-        strip_img = img_bgr
-        strip_x_offset = 0
-        strip_h, strip_w = h, w
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
 
-    # Equal-split inside cropped strip
-    box_w = strip_w // expected_pads
-    boxes = [(strip_x_offset + i * box_w, 0, box_w, h) for i in range(expected_pads)]
-    return boxes
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes = []
+    for cnt in contours:
+        x, y, ww, hh = cv2.boundingRect(cnt)
+        area = ww * hh
+        if area < (w * h) * MIN_AREA_RATIO:
+            continue
+        aspect = ww / float(hh)
+        if aspect < 0.3 or aspect > 3:
+            continue
+        boxes.append((x, y, ww, hh))
+
+    boxes_sorted = sorted(boxes, key=lambda b: b[0])
+
+    if len(boxes_sorted) != expected_pads:
+        # fallback equal-split
+        box_w = w // expected_pads
+        boxes_sorted = [(i * box_w, 0, box_w, h) for i in range(expected_pads)]
+
+    return boxes_sorted
 
 # ------------------------
 # Crop with padding
 # ------------------------
-def tight_crop(img, x, y, w, h, pad_h_ratio=0.2, pad_w_ratio=0.2):
+def tight_crop(img, x, y, w, h, pad_h_ratio=0.0, pad_w_ratio=0.0):
     pad_h = int(h * pad_h_ratio)
     pad_w = int(w * pad_w_ratio)
     x1 = max(0, x - pad_w)
@@ -121,8 +129,7 @@ def predict_from_pil_image(pil_img):
     img_np = np.array(pil_img)
     img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
 
-    # Use improved equal split for consistent crops
-    boxes = find_color_patches_equal_split(img_bgr, expected_pads=len(PARAM_ORDER))
+    boxes = find_color_patches(img_bgr, expected_pads=EXPECTED_PADS)
 
     annotated_pil = pil_img.copy()
     draw = ImageDraw.Draw(annotated_pil)
@@ -131,15 +138,14 @@ def predict_from_pil_image(pil_img):
     results = {}
     for i, param in enumerate(PARAM_ORDER):
         x, y, ww, hh = boxes[i]
-        crop = tight_crop(img_bgr, x, y, ww, hh)
+        crop = tight_crop(img_bgr, x, y, ww, hh, PAD_HEIGHT_RATIO, PAD_WIDTH_RATIO)
 
         model = models.get(param)
         pred_val = None
-
         if model is not None:
             try:
                 inp = preprocess_for_model_cv(crop)
-                pred_val = float(model.predict(inp, verbose=0)[0][0])  # Direct output
+                pred_val = float(model.predict(inp, verbose=0)[0][0])
             except Exception as e:
                 print(f"Prediction failed for {param}: {e}")
                 pred_val = None
