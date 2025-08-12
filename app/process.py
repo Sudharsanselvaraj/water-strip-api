@@ -54,48 +54,79 @@ def preprocess_for_model_cv(img_bgr):
     arr = img.astype("float32") / 255.0
     return np.expand_dims(arr, axis=0)
 
-def find_color_patches(img_bgr, expected_pads=len(PARAM_ORDER)):
+def find_color_patches(img_bgr, expected_pads=len(PARAM_ORDER), debug=False):
+    """
+    Detect color pads in a test strip image.
+    Returns sorted bounding boxes (x, y, w, h).
+    """
     h, w = img_bgr.shape[:2]
+
+    # Blur to reduce noise
     blur = cv2.GaussianBlur(img_bgr, (5, 5), 0)
+
+    # Convert to HSV for color segmentation
     hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
-    s = hsv[:, :, 1]
-    v = hsv[:, :, 2]
+    s_ch, v_ch = hsv[:, :, 1], hsv[:, :, 2]
 
-    median_s = np.median(s)
-    sat_thresh = max(12, int(median_s * 0.5))
+    # Lower saturation threshold to detect faint colors
+    sat_thresh = 15  
+    sat_mask = (s_ch > sat_thresh).astype(np.uint8) * 255
+    val_mask = (v_ch < 250).astype(np.uint8) * 255
+    mask = cv2.bitwise_and(sat_mask, val_mask)
 
-    sat_mask = (s > sat_thresh).astype("uint8") * 255
-    val_mask = (v < 250).astype("uint8") * 255
-
-    lab = cv2.cvtColor(blur, cv2.COLOR_BGR2LAB)
-    l = lab[:, :, 0]
-    nonwhite = (l < 245).astype("uint8") * 255
-
-    mask = cv2.bitwise_or(cv2.bitwise_and(sat_mask, val_mask), nonwhite)
-
+    # Morphological cleanup
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
 
+    # Find contours
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     boxes = []
     for cnt in contours:
         x, y, ww, hh = cv2.boundingRect(cnt)
-        if ww * hh < (w * h) * MIN_AREA_RATIO:
+        area = ww * hh
+        if area < (w * h) * MIN_AREA_RATIO:
             continue
-        aspect = ww / float(hh) if hh > 0 else 0
+        aspect = ww / float(hh)
         if aspect < 0.3 or aspect > 3.5:
             continue
         boxes.append((x, y, ww, hh))
 
+    # Sort left-to-right
     boxes = sorted(boxes, key=lambda b: b[0])
-    if len(boxes) != expected_pads:
-        box_w = w // expected_pads
-        boxes = [(i * box_w, 0, box_w, h) for i in range(expected_pads)]
+
+    # If too many boxes, keep the largest expected_pads
+    if len(boxes) > expected_pads:
+        boxes = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)[:expected_pads]
+        boxes = sorted(boxes, key=lambda b: b[0])
+
+    # If too few boxes, interpolate positions
+    if len(boxes) < expected_pads:
+        print(f"⚠ Detected {len(boxes)} pads, expected {expected_pads}. Interpolating.")
+        if len(boxes) > 1:
+            avg_w = int(np.mean([bw for _, _, bw, _ in boxes]))
+            step = (boxes[-1][0] - boxes[0][0]) / (expected_pads - 1)
+            boxes = [(int(boxes[0][0] + i * step), 0, avg_w, h) for i in range(expected_pads)]
+        else:
+            # Fallback equal split
+            box_w = w // expected_pads
+            boxes = [(i * box_w, 0, box_w, h) for i in range(expected_pads)]
+
+    if debug:
+        vis = img_bgr.copy()
+        for i, (x, y, ww, hh) in enumerate(boxes):
+            cv2.rectangle(vis, (x, y), (x + ww, y + hh), (0, 255, 0), 2)
+            cv2.putText(vis, str(i), (x, y - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.imwrite("debug_pads.jpg", vis)
 
     return boxes
 
-def tight_crop(img, x, y, w, h, pad_h_ratio=0.5, pad_w_ratio=0.2):
+
+def tight_crop(img, x, y, w, h, pad_h_ratio=0.2, pad_w_ratio=0.2):
+    """
+    Crop with small padding to capture full pad without too much background.
+    """
     pad_h = int(h * pad_h_ratio)
     pad_w = int(w * pad_w_ratio)
     x1 = max(0, x - pad_w)
