@@ -1,67 +1,87 @@
-import io
-import base64
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from PIL import Image
+from fastapi import FastAPI, File, UploadFile
+from fastapi.responses import JSONResponse, FileResponse
+import tensorflow as tf
+import joblib
 import numpy as np
-from .process import predict_from_strip
-from .utils import pil_to_cv2, cv2_to_jpeg_bytes, jpeg_bytes_to_base64
+from PIL import Image, ImageDraw, ImageFont
+from pathlib import Path
+import io
+import uvicorn
+import datetime
 
-app = FastAPI(title='Water Strip Analyzer')
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+BASE_DIR = Path(__file__).resolve().parent
 
-@app.post('/analyze')
-async def analyze(file: UploadFile = File(...)):
-    if file.content_type.split('/')[0] != 'image':
-        raise HTTPException(status_code=400, detail='file must be an image')
+# Load models and scalers
+models = {
+    "pH": (tf.keras.models.load_model(BASE_DIR / "models" / "pH.h5"), joblib.load(BASE_DIR / "models" / "pH_scaler.save")),
+    "Nitrate": (tf.keras.models.load_model(BASE_DIR / "models" / "Nitrate.h5"), joblib.load(BASE_DIR / "models" / "Nitrate_scaler.save")),
+    "Nitrite": (tf.keras.models.load_model(BASE_DIR / "models" / "Nitrite.h5"), joblib.load(BASE_DIR / "models" / "Nitrite_scaler.save")),
+    "Chlorine": (tf.keras.models.load_model(BASE_DIR / "models" / "Chlorine.h5"), joblib.load(BASE_DIR / "models" / "Chlorine_scaler.save")),
+    "Total Hardness": (tf.keras.models.load_model(BASE_DIR / "models" / "Hardness.h5"), joblib.load(BASE_DIR / "models" / "Hardness_scaler.save")),
+    "Carbonate": (tf.keras.models.load_model(BASE_DIR / "models" / "Carbonate.h5"), joblib.load(BASE_DIR / "models" / "Carbonate_scaler.save")),
+}
 
-    contents = await file.read()
-    pil = Image.open(io.BytesIO(contents)).convert('RGB')
-    img = pil_to_cv2(pil)
+# Parameter safe ranges for status calculation
+safe_ranges = {
+    "pH": (6.5, 8.5),
+    "Nitrate": (0, 10),
+    "Nitrite": (0, 10),
+    "Chlorine": (0, 1),
+    "Total Hardness": (0, 100),
+    "Carbonate": (0, 0.2),
+}
 
-    results, vis = predict_from_strip(img)
+app = FastAPI()
 
-    jpeg = cv2_to_jpeg_bytes(vis)
-    debug_b64 = jpeg_bytes_to_base64(jpeg)
+@app.post("/predict")
+async def predict(file: UploadFile = File(...)):
+    try:
+        # Read and preprocess image
+        img = Image.open(io.BytesIO(await file.read())).convert("RGB")
+        img_resized = img.resize((224, 224))
+        img_array = np.array(img_resized) / 255.0
+        img_array = np.expand_dims(img_array, axis=0)
 
-    response = {
-        'status': 'success',
-        'predictions': {},
-        'debug_image_base64': debug_b64
-    }
+        results = {}
+        draw = ImageDraw.Draw(img)
+        font = ImageFont.load_default()
+        y_offset = 10
 
-    # add units & simple safety logic
-    for k,v in results.items():
-        unit = 'ppm' if k.lower() != 'pH' else 'pH'
-        safe = 'unknown'
-        if v is None:
-            safe = 'unknown'
-        else:
-            if k == 'pH':
-                if 6.5 <= v <= 8.5:
-                    safe = 'safe'
-                else:
-                    safe = 'caution'
-            elif k == 'Hardness':
-                if v < 150:
-                    safe = 'safe'
-                elif v < 300:
-                    safe = 'caution'
-                else:
-                    safe = 'danger'
-            else:
-                # generic thresholds, please customize
-                if v <= 1:
-                    safe = 'safe'
-                elif v <= 5:
-                    safe = 'caution'
-                else:
-                    safe = 'danger'
+        for param, (model, scaler) in models.items():
+            # Predict and inverse scale
+            pred_scaled = model.predict(img_array)
+            pred_value = scaler.inverse_transform(pred_scaled)[0][0]
+            pred_value = float(round(pred_value, 2))
 
-        response['predictions'][k] = {
-            'value': v,
-            'unit': unit,
-            'safety': safe
-        }
+            # Determine status
+            safe_min, safe_max = safe_ranges[param]
+            status = "safe" if safe_min <= pred_value <= safe_max else "caution"
 
-    return response
+            results[param] = {
+                "value": pred_value,
+                "status": status,
+                "time": datetime.datetime.now().strftime("%Y-%m-%d %I:%M %p")
+            }
+
+            # Draw on debug image
+            draw.text((10, y_offset), f"{param}: {pred_value} ({status})", fill="red", font=font)
+            y_offset += 15
+
+        # Save debug image to memory
+        debug_img_bytes = io.BytesIO()
+        img.save(debug_img_bytes, format="PNG")
+        debug_img_bytes.seek(0)
+
+        return JSONResponse(content={
+            "parameters": results
+        }, headers={"X-Debug-Image": "Use /debug to fetch the annotated image"})
+
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+@app.get("/debug")
+async def get_debug():
+    return FileResponse("debug.png")
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=10000)
