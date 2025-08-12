@@ -4,14 +4,20 @@ import numpy as np
 import joblib
 from PIL import Image, ImageDraw, ImageFont
 import tensorflow as tf
-
-# Import utilities from the app package
 from app.utils import pil_to_bytes, bytes_to_base64
 
-# Model config
+
+# ------------------------
+# Model configuration
+# ------------------------
 MODEL_DIR = os.path.join(os.getcwd(), "models")
 PARAM_ORDER = ["Nitrate", "Nitrite", "Chlorine", "Hardness", "Carbonate", "pH"]
+IMG_SIZE = (128, 128)
+MIN_AREA_RATIO = 0.0002  # For pad detection
 
+# ------------------------
+# Helper: Find model/scaler file for a parameter
+# ------------------------
 def _find_file_for_param(param, ext_list):
     for f in os.listdir(MODEL_DIR):
         low = f.lower()
@@ -19,58 +25,62 @@ def _find_file_for_param(param, ext_list):
             return os.path.join(MODEL_DIR, f)
     return None
 
-# Load models & scalers
+# ------------------------
+# Load models and scalers
+# ------------------------
 models = {}
 scalers = {}
 for p in PARAM_ORDER:
     mfile = _find_file_for_param(p, [".h5", ".keras"])
     sfile = _find_file_for_param(p, [".save", ".pkl", ".joblib"])
+
+    # Load model
     if mfile:
         try:
             models[p] = tf.keras.models.load_model(mfile, compile=False)
-            print(f"Loaded model for {p}: {os.path.basename(mfile)}")
+            print(f"✅ Loaded model for {p}: {os.path.basename(mfile)}")
         except Exception as e:
-            print(f"Failed to load model for {p}: {e}")
+            print(f"❌ Failed to load model for {p}: {e}")
             models[p] = None
     else:
-        print(f"No model file found for {p}")
+        print(f"⚠ No model file found for {p}")
         models[p] = None
 
+    # Load scaler (optional)
     if sfile:
         try:
             scalers[p] = joblib.load(sfile)
-            print(f"Loaded scaler for {p}: {os.path.basename(sfile)}")
+            print(f"✅ Loaded scaler for {p}: {os.path.basename(sfile)}")
         except Exception as e:
-            print(f"Failed to load scaler for {p}: {e}")
+            print(f"❌ Failed to load scaler for {p}: {e}")
             scalers[p] = None
     else:
         scalers[p] = None
 
-IMG_SIZE = (128, 128)
-MIN_AREA_RATIO = 0.0002
-
+# ------------------------
+# Preprocessing
+# ------------------------
 def preprocess_for_model_cv(img_bgr):
     img = cv2.resize(img_bgr, IMG_SIZE)
     arr = img.astype("float32") / 255.0
     return np.expand_dims(arr, axis=0)
 
+# ------------------------
+# Pad detection
+# ------------------------
 def find_color_patches(img_bgr, expected_pads=len(PARAM_ORDER), debug=False):
     """
-    Detect color pads in a test strip image.
-    Returns sorted bounding boxes (x, y, w, h).
+    Detect color pads; if detection is off, fallback to equal-width split.
     """
     h, w = img_bgr.shape[:2]
 
-    # Blur to reduce noise
+    # Smooth noise
     blur = cv2.GaussianBlur(img_bgr, (5, 5), 0)
-
-    # Convert to HSV for color segmentation
     hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
     s_ch, v_ch = hsv[:, :, 1], hsv[:, :, 2]
 
-    # Lower saturation threshold to detect faint colors
-    sat_thresh = 15  
-    sat_mask = (s_ch > sat_thresh).astype(np.uint8) * 255
+    # Threshold masks
+    sat_mask = (s_ch > 15).astype(np.uint8) * 255
     val_mask = (v_ch < 250).astype(np.uint8) * 255
     mask = cv2.bitwise_and(sat_mask, val_mask)
 
@@ -84,49 +94,39 @@ def find_color_patches(img_bgr, expected_pads=len(PARAM_ORDER), debug=False):
     boxes = []
     for cnt in contours:
         x, y, ww, hh = cv2.boundingRect(cnt)
-        area = ww * hh
-        if area < (w * h) * MIN_AREA_RATIO:
+        if ww * hh < (w * h) * MIN_AREA_RATIO:
             continue
         aspect = ww / float(hh)
-        if aspect < 0.3 or aspect > 3.5:
-            continue
-        boxes.append((x, y, ww, hh))
+        if 0.3 <= aspect <= 3.5:
+            boxes.append((x, y, ww, hh))
 
-    # Sort left-to-right
     boxes = sorted(boxes, key=lambda b: b[0])
 
-    # If too many boxes, keep the largest expected_pads
+    # Keep only top `expected_pads`
     if len(boxes) > expected_pads:
         boxes = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)[:expected_pads]
         boxes = sorted(boxes, key=lambda b: b[0])
 
-    # If too few boxes, interpolate positions
-    if len(boxes) < expected_pads:
-        print(f"⚠ Detected {len(boxes)} pads, expected {expected_pads}. Interpolating.")
-        if len(boxes) > 1:
-            avg_w = int(np.mean([bw for _, _, bw, _ in boxes]))
-            step = (boxes[-1][0] - boxes[0][0]) / (expected_pads - 1)
-            boxes = [(int(boxes[0][0] + i * step), 0, avg_w, h) for i in range(expected_pads)]
-        else:
-            # Fallback equal split
-            box_w = w // expected_pads
-            boxes = [(i * box_w, 0, box_w, h) for i in range(expected_pads)]
+    # Fallback if fewer boxes detected
+    if len(boxes) != expected_pads:
+        print(f"⚠ Pad detection mismatch: {len(boxes)} found, {expected_pads} expected. Using equal split.")
+        box_w = w // expected_pads
+        boxes = [(i * box_w, 0, box_w, h) for i in range(expected_pads)]
 
+    # Debug visualization
     if debug:
         vis = img_bgr.copy()
         for i, (x, y, ww, hh) in enumerate(boxes):
             cv2.rectangle(vis, (x, y), (x + ww, y + hh), (0, 255, 0), 2)
-            cv2.putText(vis, str(i), (x, y - 6),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(vis, str(i), (x, y - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         cv2.imwrite("debug_pads.jpg", vis)
 
     return boxes
 
-
+# ------------------------
+# Crop function
+# ------------------------
 def tight_crop(img, x, y, w, h, pad_h_ratio=0.2, pad_w_ratio=0.2):
-    """
-    Crop with small padding to capture full pad without too much background.
-    """
     pad_h = int(h * pad_h_ratio)
     pad_w = int(w * pad_w_ratio)
     x1 = max(0, x - pad_w)
@@ -135,6 +135,9 @@ def tight_crop(img, x, y, w, h, pad_h_ratio=0.2, pad_w_ratio=0.2):
     y2 = min(img.shape[0], y + h + pad_h)
     return img[y1:y2, x1:x2]
 
+# ------------------------
+# Status classification
+# ------------------------
 def classify_status(param, value):
     if value is None:
         return "unknown"
@@ -146,17 +149,16 @@ def classify_status(param, value):
     if param.lower() == "ph":
         return "safe" if 6.5 <= v <= 8.5 else "caution"
     if param.lower() == "hardness":
-        if v < 150:
-            return "safe"
-        if v < 300:
-            return "caution"
-        return "danger"
+        return "safe" if v < 150 else "caution" if v < 300 else "danger"
     if v <= 1:
         return "safe"
     if v <= 5:
         return "caution"
     return "danger"
 
+# ------------------------
+# Prediction pipeline
+# ------------------------
 def predict_from_pil_image(pil_img):
     img_np = np.array(pil_img)
     img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
@@ -164,10 +166,7 @@ def predict_from_pil_image(pil_img):
 
     annotated_pil = pil_img.copy()
     draw = ImageDraw.Draw(annotated_pil)
-    try:
-        font = ImageFont.load_default()
-    except Exception:
-        font = None
+    font = ImageFont.load_default()
 
     results = {}
     for i, param in enumerate(PARAM_ORDER):
@@ -182,13 +181,16 @@ def predict_from_pil_image(pil_img):
             try:
                 inp = preprocess_for_model_cv(crop)
                 pred_scaled = float(model.predict(inp, verbose=0)[0][0])
-                if scaler is not None and -0.05 <= pred_scaled <= 1.05:
+
+                # ✅ Only apply scaler if it was used during training
+                if scaler is not None:
                     try:
                         pred_val = float(scaler.inverse_transform([[pred_scaled]])[0][0])
                     except Exception:
-                        pred_val = float(pred_scaled)
+                        pred_val = pred_scaled
                 else:
-                    pred_val = float(pred_scaled)
+                    pred_val = pred_scaled
+
             except Exception as e:
                 print(f"Prediction failed for {param}: {e}")
                 pred_val = None
@@ -200,6 +202,7 @@ def predict_from_pil_image(pil_img):
             "safety": classify_status(param, pred_val)
         }
 
+        # Draw annotations
         draw.rectangle([(x, y), (x + ww, y + hh)], outline="lime", width=2)
         label = f"{param}: {results[key]['value']}"
         draw.text((x, max(0, y - 12)), label, fill="red", font=font)
