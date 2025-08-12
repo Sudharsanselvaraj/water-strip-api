@@ -6,10 +6,8 @@ from PIL import Image, ImageDraw, ImageFont
 import base64
 import io
 
-from app.utils import pil_to_bytes, bytes_to_base64  # If you keep these utils separately, else see below
-
 # ------------------------
-# Utility functions (if not imported from app.utils)
+# Utility functions (optional if not imported from utils)
 # ------------------------
 def pil_to_bytes(pil_img, fmt="JPEG", quality=85):
     bio = io.BytesIO()
@@ -163,7 +161,42 @@ def classify_status(param, value):
     return "danger"
 
 # ------------------------
-# Prediction pipeline (with denormalization)
+# Overall water quality assessment
+# ------------------------
+def overall_quality_assessment(results):
+    """
+    Assess overall water quality based on individual parameters.
+    Returns a summary string and a brief description.
+    """
+    score = 0
+    max_score = len(results) * 2  # 2 points for safe, 1 for caution, 0 for danger/unknown
+
+    for param, info in results.items():
+        safety = info.get("safety", "unknown")
+        if safety == "safe":
+            score += 2
+        elif safety == "caution":
+            score += 1
+
+    perc = (score / max_score) * 100 if max_score else 0
+
+    if perc >= 90:
+        overall = "Excellent"
+        desc = "Water quality is excellent and safe for all uses."
+    elif perc >= 70:
+        overall = "Good"
+        desc = "Water quality is generally good with minor concerns."
+    elif perc >= 50:
+        overall = "Moderate"
+        desc = "Water quality shows some concerns; use caution."
+    else:
+        overall = "Poor"
+        desc = "Water quality is poor and may pose health risks."
+
+    return overall, desc
+
+# ------------------------
+# Prediction pipeline (with denormalization and overall quality)
 # ------------------------
 def predict_from_pil_image(pil_img):
     img_np = np.array(pil_img)
@@ -211,4 +244,6 @@ def predict_from_pil_image(pil_img):
         label = f"{param}: {results[key]['value']}"
         draw.text((x, max(0, y - 12)), label, fill="red", font=font)
 
-    return results, annotated_pil
+    overall_quality, quality_description = overall_quality_assessment(results)
+
+    return results, annotated_pil, overall_quality, quality_description
