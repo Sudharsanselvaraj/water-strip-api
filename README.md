@@ -1,1 +1,0 @@
-# water-strip-api
