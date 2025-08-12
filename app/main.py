@@ -1,7 +1,9 @@
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse
 import tempfile
-from process import process_image, predict_all
+from app.process import process_image, predict_all
+from app.utils import some_function
+
 
 app = FastAPI()
 
