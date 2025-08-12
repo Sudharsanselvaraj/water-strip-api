@@ -1,140 +1,67 @@
-import os
 import cv2
 import numpy as np
-import joblib
-from PIL import Image, ImageDraw, ImageFont
 import tensorflow as tf
+import pickle
 
-MODEL_DIR = os.path.join(os.getcwd(), "models")
-PARAM_ORDER = ["Nitrate", "Nitrite", "Chlorine", "Hardness", "Carbonate", "pH"]
+# Load all models & scalers from your current directory
+MODELS = {
+    "Carbonate": ("Carbonate.h5", "Carbonate_scaler.save"),
+    "Chlorine": ("Chlorine.h5", "Chlorine_scaler.save"),
+    "Hardness": ("Hardness.h5", "Hardness_scaler.save"),
+    "Nitrate": ("Nitrate.h5", "Nitrate_scaler.save"),
+    "Nitrite": ("Nitrite.h5", "Nitrite_scaler.save"),
+    "pH": ("pH.h5", "pH_scaler.save")
+}
 
-def _find_file_for_param(param, ext_list):
-    for f in os.listdir(MODEL_DIR):
-        low = f.lower()
-        if any(low.endswith(ext) and param.lower() in low for ext in ext_list):
-            return os.path.join(MODEL_DIR, f)
-    return None
+loaded_models = {}
+loaded_scalers = {}
 
-# Load models & scalers
-models = {}
-scalers = {}
-for p in PARAM_ORDER:
-    mfile = _find_file_for_param(p, [".h5", ".keras"])
-    sfile = _find_file_for_param(p, [".save", ".pkl", ".joblib"])
-    if mfile:
-        try:
-            models[p] = tf.keras.models.load_model(mfile, compile=False)
-            print(f"Loaded model for {p}: {os.path.basename(mfile)}")
-        except Exception as e:
-            print(f"Failed to load model for {p}: {e}")
-            models[p] = None
-    else:
-        models[p] = None
+for key, (model_path, scaler_path) in MODELS.items():
+    loaded_models[key] = tf.keras.models.load_model(model_path)
+    with open(scaler_path, "rb") as f:
+        loaded_scalers[key] = pickle.load(f)
 
-    if sfile:
-        try:
-            scalers[p] = joblib.load(sfile)
-            print(f"Loaded scaler for {p}: {os.path.basename(sfile)}")
-        except Exception as e:
-            scalers[p] = None
-    else:
-        scalers[p] = None
+def find_color_patches(image):
+    orig_h, orig_w = image.shape[:2]
+    image_resized = cv2.resize(image, (800, int(800 * orig_h / orig_w)))
 
-IMG_SIZE = (128, 128)
+    hsv = cv2.cvtColor(image_resized, cv2.COLOR_BGR2HSV)
+    lower_bound = np.array([0, 40, 40])
+    upper_bound = np.array([179, 255, 255])
+    mask = cv2.inRange(hsv, lower_bound, upper_bound)
 
-def preprocess_for_model_cv(img_bgr):
-    img = cv2.resize(img_bgr, IMG_SIZE)
-    arr = img.astype("float32") / 255.0
-    return np.expand_dims(arr, axis=0)
+    kernel = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
-def find_color_patches(img_bgr, expected_pads=len(PARAM_ORDER)):
-    """
-    Use a simpler fixed-split method matching training setup
-    to ensure consistent crops in deployment.
-    """
-    h, w = img_bgr.shape[:2]
-    box_w = w // expected_pads
-    boxes = [(i * box_w, 0, box_w, h) for i in range(expected_pads)]
-    return boxes
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    patches = [(x, y, w, h) for (x, y, w, h) in (cv2.boundingRect(c) for c in contours) if w * h > 5000]
+    patches = sorted(patches, key=lambda b: (b[1], b[0]))
+    return patches, image_resized
 
-def tight_crop(img, x, y, w, h, pad_h_ratio=0.2, pad_w_ratio=0.1):
-    pad_h = int(h * pad_h_ratio)
-    pad_w = int(w * pad_w_ratio)
-    x1 = max(0, x - pad_w)
-    y1 = max(0, y - pad_h)
-    x2 = min(img.shape[1], x + w + pad_w)
-    y2 = min(img.shape[0], y + h + pad_h)
-    return img[y1:y2, x1:x2]
+def process_image(path):
+    image = cv2.imread(path)
+    boxes, resized_img = find_color_patches(image)
+    patch_images = []
+    for (x, y, w, h) in boxes:
+        crop = resized_img[y:y+h, x:x+w]
+        crop = cv2.resize(crop, (224, 224))
+        patch_images.append(crop)
+    return patch_images
 
-def classify_status(param, value):
-    if value is None:
-        return "unknown"
-    try:
-        v = float(value)
-    except Exception:
-        return "unknown"
-
-    if param.lower() == "ph":
-        return "safe" if 6.5 <= v <= 8.5 else "caution"
-    if param.lower() == "hardness":
-        if v < 150:
-            return "safe"
-        if v < 300:
-            return "caution"
-        return "danger"
-    if v <= 1:
-        return "safe"
-    if v <= 5:
-        return "caution"
-    return "danger"
-
-def predict_from_pil_image(pil_img):
-    img_np = np.array(pil_img)
-    img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-    boxes = find_color_patches(img_bgr, expected_pads=len(PARAM_ORDER))
-
-    annotated_pil = pil_img.copy()
-    draw = ImageDraw.Draw(annotated_pil)
-    try:
-        font = ImageFont.load_default()
-    except Exception:
-        font = None
-
+def predict_all(patches):
     results = {}
-    for i, param in enumerate(PARAM_ORDER):
-        x, y, ww, hh = boxes[i]
-        crop = tight_crop(img_bgr, x, y, ww, hh)
-
-        model = models.get(param)
-        scaler = scalers.get(param)
-        pred_val = None
-
-        if model is not None:
+    for param, model in loaded_models.items():
+        scaler = loaded_scalers[param]
+        param_preds = []
+        for patch in patches:
+            patch_norm = patch.astype("float32") / 255.0
+            patch_norm = np.expand_dims(patch_norm, axis=0)
+            pred_scaled = model.predict(patch_norm, verbose=0)[0][0]
             try:
-                inp = preprocess_for_model_cv(crop)
-                pred_scaled = float(model.predict(inp, verbose=0)[0][0])
-
-                if scaler is not None:
-                    try:
-                        pred_val = float(scaler.inverse_transform([[pred_scaled]])[0][0])
-                    except Exception:
-                        pred_val = pred_scaled
-                else:
-                    pred_val = pred_scaled
-            except Exception as e:
-                print(f"Prediction failed for {param}: {e}")
-                pred_val = None
-
-        key = param if param != "Hardness" else "Total Hardness"
-        results[key] = {
-            "value": round(pred_val, 3) if pred_val is not None else None,
-            "unit": "pH" if param.lower() == "ph" else "ppm",
-            "safety": classify_status(param, pred_val)
-        }
-
-        # draw rectangle + label
-        draw.rectangle([(x, y), (x + ww, y + hh)], outline="lime", width=2)
-        label = f"{param}: {results[key]['value']}"
-        draw.text((x, max(0, y - 12)), label, fill="red", font=font)
-
-    return results, annotated_pil
+                pred_val = float(scaler.inverse_transform([[pred_scaled]])[0][0])
+            except Exception:
+                pred_val = float(pred_scaled)
+            param_preds.append(pred_val)
+        results[param] = param_preds
+    return results
