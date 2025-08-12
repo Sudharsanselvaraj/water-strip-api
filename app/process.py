@@ -37,6 +37,60 @@ def denormalize(param, normalized_val):
     return round(real_val, 3)
 
 # ------------------------
+# Parameter info with descriptions and health effects
+# ------------------------
+PARAM_INFO = {
+    "pH": {
+        "description": "Measures acidity/alkalinity. Critical for drinking water safety and taste.",
+        "health_effects": {
+            "safe": "Safe pH levels. No adverse health effects.",
+            "caution": "Slightly abnormal pH levels may cause minor skin/eye irritation.",
+            "danger": "Extreme pH levels can cause skin/eye irritation and affect mineral absorption."
+        }
+    },
+    "Nitrate": {
+        "description": "Chemical compound that can indicate agricultural pollution.",
+        "health_effects": {
+            "safe": "Within safe limits. No health risks.",
+            "caution": "Elevated nitrate levels may affect sensitive groups.",
+            "danger": "High levels can cause methemoglobinemia (blue baby syndrome) in infants."
+        }
+    },
+    "Nitrite": {
+        "description": "Chemical compound from nitrification, harmful in high levels.",
+        "health_effects": {
+            "safe": "Safe nitrite levels detected.",
+            "caution": "Nitrite levels nearing caution threshold.",
+            "danger": "High nitrite levels are toxic and pose serious health risks."
+        }
+    },
+    "Chlorine": {
+        "description": "Disinfectant used to kill bacteria and viruses in water treatment.",
+        "health_effects": {
+            "safe": "Chlorine at safe disinfectant levels.",
+            "caution": "High chlorine levels may cause taste/odor issues.",
+            "danger": "Excessive chlorine can be harmful and cause irritation."
+        }
+    },
+    "Total Hardness": {
+        "description": "Mineral content, primarily calcium and magnesium.",
+        "health_effects": {
+            "safe": "Hardness within acceptable range, no health impact.",
+            "caution": "Hardness might reduce soap effectiveness and affect appliances.",
+            "danger": "Very hard water can cause scaling and plumbing issues."
+        }
+    },
+    "Carbonate": {
+        "description": "Contributes to alkalinity, affects water pH and scaling potential.",
+        "health_effects": {
+            "safe": "Carbonate levels normal.",
+            "caution": "Elevated carbonate may affect water quality.",
+            "danger": "High carbonate levels cause scaling and may affect health indirectly."
+        }
+    }
+}
+
+# ------------------------
 # Model configuration
 # ------------------------
 MODEL_DIR = os.path.join(os.getcwd(), "models")
@@ -233,10 +287,20 @@ def predict_from_pil_image(pil_img):
         real_val = denormalize(param, pred_val)
 
         key = param if param != "Hardness" else "Total Hardness"
+        safety = classify_status(param, real_val)
+
+        # Add description & health effects based on safety
+        param_info_key = key  # "Total Hardness" instead of "Hardness"
+        info = PARAM_INFO.get(param_info_key, {})
+        description = info.get("description", "No description available.")
+        health_effects = info.get("health_effects", {}).get(safety, "No health effects information.")
+
         results[key] = {
             "value": real_val,
             "unit": "pH" if param.lower() == "ph" else "ppm",
-            "safety": classify_status(param, real_val)
+            "safety": safety,
+            "description": description,
+            "health_effects": health_effects,
         }
 
         # Draw bounding boxes + label (with real value)
