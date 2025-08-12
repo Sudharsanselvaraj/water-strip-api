@@ -2,7 +2,7 @@ import base64
 import io
 from PIL import Image
 
-def pil_to_bytes(pil_img, fmt="JPEG", quality=95):
+def pil_to_bytes(pil_img, fmt="JPEG", quality=85):
     bio = io.BytesIO()
     pil_img.save(bio, format=fmt, quality=quality)
     bio.seek(0)
