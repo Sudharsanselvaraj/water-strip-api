@@ -3,7 +3,7 @@ import numpy as np
 import tensorflow as tf
 import pickle
 import os
-from utils import pil_to_bytes, bytes_to_base64
+from app.utils import pil_to_bytes, bytes_to_base64
 from PIL import Image
 
 # Model & scaler paths
