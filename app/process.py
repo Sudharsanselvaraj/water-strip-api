@@ -1,8 +1,8 @@
 import os
 import cv2
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
 import tensorflow as tf
+from PIL import Image, ImageDraw, ImageFont
 from app.utils import pil_to_bytes, bytes_to_base64
 
 # ------------------------
@@ -10,17 +10,17 @@ from app.utils import pil_to_bytes, bytes_to_base64
 # ------------------------
 MODEL_DIR = os.path.join(os.getcwd(), "models")
 PARAM_ORDER = ["Nitrate", "Nitrite", "Chlorine", "Hardness", "Carbonate", "pH"]
-EXPECTED_PADS = len(PARAM_ORDER)
 IMG_SIZE = (128, 128)
+EXPECTED_PADS = len(PARAM_ORDER)
 
-# Tuned HSV detection parameters
-SAT_THRESHOLD = 15        # Lower to catch pale pads
-MIN_AREA_RATIO = 0.0003   # Smaller pads won't be missed
-PAD_HEIGHT_RATIO = 0.85   # Slightly larger crop vertically
-PAD_WIDTH_RATIO = 0.85    # Slightly larger crop horizontally
+# Detection tuning
+SAT_THRESHOLD = 25
+MIN_AREA_RATIO = 0.0005
+PAD_HEIGHT_RATIO = 0.8
+PAD_WIDTH_RATIO = 0.8
 
 # ------------------------
-# Load models
+# Helper: Find model file
 # ------------------------
 def _find_file_for_param(param, ext_list):
     for f in os.listdir(MODEL_DIR):
@@ -29,6 +29,9 @@ def _find_file_for_param(param, ext_list):
             return os.path.join(MODEL_DIR, f)
     return None
 
+# ------------------------
+# Load models
+# ------------------------
 models = {}
 for p in PARAM_ORDER:
     mfile = _find_file_for_param(p, [".h5", ".keras"])
@@ -52,9 +55,9 @@ def preprocess_for_model_cv(img_bgr):
     return np.expand_dims(arr, axis=0)
 
 # ------------------------
-# Pad detection (HSV + contour)
+# Pad detection (Colab logic)
 # ------------------------
-def find_color_patches(img_bgr, expected_pads=EXPECTED_PADS):
+def find_color_patches(img_bgr, debug=False):
     h, w = img_bgr.shape[:2]
     blur = cv2.GaussianBlur(img_bgr, (5, 5), 0)
     hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
@@ -80,14 +83,18 @@ def find_color_patches(img_bgr, expected_pads=EXPECTED_PADS):
             continue
         boxes.append((x, y, ww, hh))
 
+    # Sort left-to-right
     boxes_sorted = sorted(boxes, key=lambda b: b[0])
 
-    if len(boxes_sorted) != expected_pads:
-        # fallback equal-split
-        box_w = w // expected_pads
-        boxes_sorted = [(i * box_w, 0, box_w, h) for i in range(expected_pads)]
-
     return boxes_sorted
+
+# ------------------------
+# Fallback equal split
+# ------------------------
+def fallback_equal_split(img):
+    h, w = img.shape[:2]
+    box_width = w // EXPECTED_PADS
+    return [(i * box_width, 0, box_width, h) for i in range(EXPECTED_PADS)]
 
 # ------------------------
 # Crop with padding
@@ -129,7 +136,12 @@ def predict_from_pil_image(pil_img):
     img_np = np.array(pil_img)
     img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
 
-    boxes = find_color_patches(img_bgr, expected_pads=EXPECTED_PADS)
+    # First try HSV contour detection
+    boxes = find_color_patches(img_bgr, debug=False)
+
+    if len(boxes) != EXPECTED_PADS:
+        print(f"⚠ Detected {len(boxes)} pads, expected {EXPECTED_PADS}. Using fallback equal-split.")
+        boxes = fallback_equal_split(img_bgr)
 
     annotated_pil = pil_img.copy()
     draw = ImageDraw.Draw(annotated_pil)
@@ -142,6 +154,7 @@ def predict_from_pil_image(pil_img):
 
         model = models.get(param)
         pred_val = None
+
         if model is not None:
             try:
                 inp = preprocess_for_model_cv(crop)
@@ -157,7 +170,7 @@ def predict_from_pil_image(pil_img):
             "safety": classify_status(param, pred_val)
         }
 
-        # Draw bounding boxes
+        # Draw bounding boxes + label
         draw.rectangle([(x, y), (x + ww, y + hh)], outline="lime", width=2)
         label = f"{param}: {results[key]['value']}"
         draw.text((x, max(0, y - 12)), label, fill="red", font=font)
