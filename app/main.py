@@ -1,22 +1,27 @@
-# app/main.py
-import math
+import os
+import io
+import uuid
+from datetime import datetime
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+from PIL import Image
 
-def sanitize_for_json(obj):
-    """Recursively replace NaN/inf with safe numbers or None."""
-    if isinstance(obj, float):
-        if math.isnan(obj):
-            return None
-        if math.isinf(obj):
-            return 1e9 if obj > 0 else -1e9
-        return obj
-    elif isinstance(obj, dict):
-        return {k: sanitize_for_json(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [sanitize_for_json(v) for v in obj]
-    return obj
+from .process import predict_from_pil_image
+
+# Config
+DEBUG_DIR = os.path.join(os.getcwd(), "debug")
+os.makedirs(DEBUG_DIR, exist_ok=True)
+
+app = FastAPI(title="Water Strip Analyzer")
+
+# Serve debug images at /debug/<filename>
+app.mount("/debug", StaticFiles(directory=DEBUG_DIR), name="debug")
+
 
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
+    """Analyze uploaded image and return predictions + debug image URL."""
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Uploaded file must be an image")
 
@@ -27,21 +32,21 @@ async def analyze(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail=f"Cannot open image: {e}")
 
     try:
+        # Run prediction
         results, debug_img = predict_from_pil_image(pil)
 
-        # Sanitize output
-        results = sanitize_for_json(results)
-
+        # Save debug image to disk
         filename = f"debug_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}.jpg"
         debug_path = os.path.join(DEBUG_DIR, filename)
         debug_img.save(debug_path, format="JPEG", quality=85)
 
+        # Build response
         return JSONResponse(content={
             "status": "success",
             "timestamp": datetime.now().strftime("%Y-%m-%d %I:%M %p"),
             "predictions": results,
             "debug_image_url": f"/debug/{filename}"
         })
-
     except Exception as e:
+        # return more informative server error
         raise HTTPException(status_code=500, detail=f"Processing failed: {e}")
