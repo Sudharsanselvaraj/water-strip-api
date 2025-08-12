@@ -6,17 +6,15 @@ from PIL import Image, ImageDraw, ImageFont
 import tensorflow as tf
 from app.utils import pil_to_bytes, bytes_to_base64
 
-
 # ------------------------
 # Model configuration
 # ------------------------
 MODEL_DIR = os.path.join(os.getcwd(), "models")
 PARAM_ORDER = ["Nitrate", "Nitrite", "Chlorine", "Hardness", "Carbonate", "pH"]
 IMG_SIZE = (128, 128)
-MIN_AREA_RATIO = 0.0002  # For pad detection
 
 # ------------------------
-# Helper: Find model/scaler file for a parameter
+# Helper: Find model file
 # ------------------------
 def _find_file_for_param(param, ext_list):
     for f in os.listdir(MODEL_DIR):
@@ -26,15 +24,11 @@ def _find_file_for_param(param, ext_list):
     return None
 
 # ------------------------
-# Load models and scalers
+# Load models
 # ------------------------
 models = {}
-scalers = {}
 for p in PARAM_ORDER:
     mfile = _find_file_for_param(p, [".h5", ".keras"])
-    sfile = _find_file_for_param(p, [".save", ".pkl", ".joblib"])
-
-    # Load model
     if mfile:
         try:
             models[p] = tf.keras.models.load_model(mfile, compile=False)
@@ -46,17 +40,6 @@ for p in PARAM_ORDER:
         print(f"⚠ No model file found for {p}")
         models[p] = None
 
-    # Load scaler (optional)
-    if sfile:
-        try:
-            scalers[p] = joblib.load(sfile)
-            print(f"✅ Loaded scaler for {p}: {os.path.basename(sfile)}")
-        except Exception as e:
-            print(f"❌ Failed to load scaler for {p}: {e}")
-            scalers[p] = None
-    else:
-        scalers[p] = None
-
 # ------------------------
 # Preprocessing
 # ------------------------
@@ -66,65 +49,16 @@ def preprocess_for_model_cv(img_bgr):
     return np.expand_dims(arr, axis=0)
 
 # ------------------------
-# Pad detection
+# Equal-split pad detection (consistent crops)
 # ------------------------
-def find_color_patches(img_bgr, expected_pads=len(PARAM_ORDER), debug=False):
-    """
-    Detect color pads; if detection is off, fallback to equal-width split.
-    """
+def find_color_patches_equal_split(img_bgr, expected_pads=len(PARAM_ORDER)):
+    """Split image evenly into vertical sections for pad cropping."""
     h, w = img_bgr.shape[:2]
-
-    # Smooth noise
-    blur = cv2.GaussianBlur(img_bgr, (5, 5), 0)
-    hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
-    s_ch, v_ch = hsv[:, :, 1], hsv[:, :, 2]
-
-    # Threshold masks
-    sat_mask = (s_ch > 15).astype(np.uint8) * 255
-    val_mask = (v_ch < 250).astype(np.uint8) * 255
-    mask = cv2.bitwise_and(sat_mask, val_mask)
-
-    # Morphological cleanup
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-
-    # Find contours
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    boxes = []
-    for cnt in contours:
-        x, y, ww, hh = cv2.boundingRect(cnt)
-        if ww * hh < (w * h) * MIN_AREA_RATIO:
-            continue
-        aspect = ww / float(hh)
-        if 0.3 <= aspect <= 3.5:
-            boxes.append((x, y, ww, hh))
-
-    boxes = sorted(boxes, key=lambda b: b[0])
-
-    # Keep only top `expected_pads`
-    if len(boxes) > expected_pads:
-        boxes = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)[:expected_pads]
-        boxes = sorted(boxes, key=lambda b: b[0])
-
-    # Fallback if fewer boxes detected
-    if len(boxes) != expected_pads:
-        print(f"⚠ Pad detection mismatch: {len(boxes)} found, {expected_pads} expected. Using equal split.")
-        box_w = w // expected_pads
-        boxes = [(i * box_w, 0, box_w, h) for i in range(expected_pads)]
-
-    # Debug visualization
-    if debug:
-        vis = img_bgr.copy()
-        for i, (x, y, ww, hh) in enumerate(boxes):
-            cv2.rectangle(vis, (x, y), (x + ww, y + hh), (0, 255, 0), 2)
-            cv2.putText(vis, str(i), (x, y - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.imwrite("debug_pads.jpg", vis)
-
-    return boxes
+    box_w = w // expected_pads
+    return [(i * box_w, 0, box_w, h) for i in range(expected_pads)]
 
 # ------------------------
-# Crop function
+# Crop with padding
 # ------------------------
 def tight_crop(img, x, y, w, h, pad_h_ratio=0.2, pad_w_ratio=0.2):
     pad_h = int(h * pad_h_ratio)
@@ -162,7 +96,9 @@ def classify_status(param, value):
 def predict_from_pil_image(pil_img):
     img_np = np.array(pil_img)
     img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-    boxes = find_color_patches(img_bgr, expected_pads=len(PARAM_ORDER))
+
+    # Always use equal split for consistent crops
+    boxes = find_color_patches_equal_split(img_bgr, expected_pads=len(PARAM_ORDER))
 
     annotated_pil = pil_img.copy()
     draw = ImageDraw.Draw(annotated_pil)
@@ -174,23 +110,12 @@ def predict_from_pil_image(pil_img):
         crop = tight_crop(img_bgr, x, y, ww, hh)
 
         model = models.get(param)
-        scaler = scalers.get(param)
         pred_val = None
 
         if model is not None:
             try:
                 inp = preprocess_for_model_cv(crop)
-                pred_scaled = float(model.predict(inp, verbose=0)[0][0])
-
-                # ✅ Only apply scaler if it was used during training
-                if scaler is not None:
-                    try:
-                        pred_val = float(scaler.inverse_transform([[pred_scaled]])[0][0])
-                    except Exception:
-                        pred_val = pred_scaled
-                else:
-                    pred_val = pred_scaled
-
+                pred_val = float(model.predict(inp, verbose=0)[0][0])  # Direct output, no scaler
             except Exception as e:
                 print(f"Prediction failed for {param}: {e}")
                 pred_val = None
@@ -202,7 +127,7 @@ def predict_from_pil_image(pil_img):
             "safety": classify_status(param, pred_val)
         }
 
-        # Draw annotations
+        # Draw bounding boxes
         draw.rectangle([(x, y), (x + ww, y + hh)], outline="lime", width=2)
         label = f"{param}: {results[key]['value']}"
         draw.text((x, max(0, y - 12)), label, fill="red", font=font)
