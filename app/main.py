@@ -1,87 +1,108 @@
-from fastapi import FastAPI, File, UploadFile
-from fastapi.responses import JSONResponse, FileResponse
-import tensorflow as tf
-import joblib
-import numpy as np
-from PIL import Image, ImageDraw, ImageFont
-from pathlib import Path
+import os
 import io
-import uvicorn
-import datetime
+from datetime import datetime
+from fastapi import FastAPI, File, UploadFile
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+import numpy as np
+import joblib
+import tensorflow as tf
+from PIL import Image
 
-BASE_DIR = Path(__file__).resolve().parent
+from process import process_strip_image
+from utils import classify_status
+
+# Create app
+app = FastAPI()
+
+# Paths
+MODEL_DIR = "models"
+DEBUG_DIR = "debug_images"
+os.makedirs(DEBUG_DIR, exist_ok=True)
+
+# Mount static debug images
+app.mount("/debug", StaticFiles(directory=DEBUG_DIR), name="debug")
+
+# Parameter metadata
+PARAM_INFO = {
+    "pH": {
+        "description": "Measures acidity/alkalinity. Critical for drinking water safety and taste.",
+        "health": "Extreme pH levels can cause skin/eye irritation and affect mineral absorption."
+    },
+    "Nitrate": {
+        "description": "Measures nitrate concentration in water.",
+        "health": "High nitrate levels can cause health issues, especially in infants."
+    },
+    "Nitrite": {
+        "description": "Measures nitrite concentration in water.",
+        "health": "Nitrite can interfere with oxygen transport in the blood."
+    },
+    "Chlorine": {
+        "description": "Measures residual chlorine in water.",
+        "health": "Too much chlorine can cause irritation; too little may allow bacterial growth."
+    },
+    "Total Hardness": {
+        "description": "Measures calcium and magnesium content.",
+        "health": "High hardness can cause scaling and affect soap efficiency."
+    },
+    "Carbonate": {
+        "description": "Measures carbonate concentration.",
+        "health": "Carbonates affect pH balance and alkalinity."
+    }
+}
 
 # Load models and scalers
-models = {
-    "pH": (tf.keras.models.load_model(BASE_DIR / "models" / "pH.h5"), joblib.load(BASE_DIR / "models" / "pH_scaler.save")),
-    "Nitrate": (tf.keras.models.load_model(BASE_DIR / "models" / "Nitrate.h5"), joblib.load(BASE_DIR / "models" / "Nitrate_scaler.save")),
-    "Nitrite": (tf.keras.models.load_model(BASE_DIR / "models" / "Nitrite.h5"), joblib.load(BASE_DIR / "models" / "Nitrite_scaler.save")),
-    "Chlorine": (tf.keras.models.load_model(BASE_DIR / "models" / "Chlorine.h5"), joblib.load(BASE_DIR / "models" / "Chlorine_scaler.save")),
-    "Total Hardness": (tf.keras.models.load_model(BASE_DIR / "models" / "Hardness.h5"), joblib.load(BASE_DIR / "models" / "Hardness_scaler.save")),
-    "Carbonate": (tf.keras.models.load_model(BASE_DIR / "models" / "Carbonate.h5"), joblib.load(BASE_DIR / "models" / "Carbonate_scaler.save")),
-}
+models = {}
+scalers = {}
 
-# Parameter safe ranges for status calculation
-safe_ranges = {
-    "pH": (6.5, 8.5),
-    "Nitrate": (0, 10),
-    "Nitrite": (0, 10),
-    "Chlorine": (0, 1),
-    "Total Hardness": (0, 100),
-    "Carbonate": (0, 0.2),
-}
+for param in ["pH", "Nitrate", "Nitrite", "Chlorine", "Hardness", "Carbonate"]:
+    h5_path = os.path.join(MODEL_DIR, f"{param.replace(' ', '')}.h5")
+    scaler_path = os.path.join(MODEL_DIR, f"{param.replace(' ', '')}_scaler.save")
 
-app = FastAPI()
+    if os.path.exists(h5_path) and os.path.exists(scaler_path):
+        models[param] = tf.keras.models.load_model(h5_path)
+        scalers[param] = joblib.load(scaler_path)
+    else:
+        print(f"⚠ Missing model or scaler for {param}")
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     try:
-        # Read and preprocess image
-        img = Image.open(io.BytesIO(await file.read())).convert("RGB")
-        img_resized = img.resize((224, 224))
-        img_array = np.array(img_resized) / 255.0
-        img_array = np.expand_dims(img_array, axis=0)
+        # Save uploaded image temporarily
+        img_bytes = await file.read()
+        img = Image.open(io.BytesIO(img_bytes))
+        
+        # Generate debug image path
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        debug_img_path = os.path.join(DEBUG_DIR, f"debug_{timestamp}.jpg")
+        
+        # Process image (extract features for prediction)
+        features = process_strip_image(img, debug_img_path)
 
+        # Prepare output
         results = {}
-        draw = ImageDraw.Draw(img)
-        font = ImageFont.load_default()
-        y_offset = 10
 
-        for param, (model, scaler) in models.items():
-            # Predict and inverse scale
-            pred_scaled = model.predict(img_array)
-            pred_value = scaler.inverse_transform(pred_scaled)[0][0]
-            pred_value = float(round(pred_value, 2))
+        for param in models:
+            scaler = scalers[param]
+            model = models[param]
 
-            # Determine status
-            safe_min, safe_max = safe_ranges[param]
-            status = "safe" if safe_min <= pred_value <= safe_max else "caution"
+            scaled_features = scaler.transform([features])
+            prediction = model.predict(scaled_features)[0][0]
+
+            status = classify_status(param, prediction)
 
             results[param] = {
-                "value": pred_value,
+                "value": round(float(prediction), 2),
                 "status": status,
-                "time": datetime.datetime.now().strftime("%Y-%m-%d %I:%M %p")
+                "description": PARAM_INFO[param]["description"],
+                "health_effects": PARAM_INFO[param]["health"],
+                "timestamp": datetime.now().strftime("%Y-%m-%d %I:%M %p")
             }
 
-            # Draw on debug image
-            draw.text((10, y_offset), f"{param}: {pred_value} ({status})", fill="red", font=font)
-            y_offset += 15
-
-        # Save debug image to memory
-        debug_img_bytes = io.BytesIO()
-        img.save(debug_img_bytes, format="PNG")
-        debug_img_bytes.seek(0)
-
         return JSONResponse(content={
-            "parameters": results
-        }, headers={"X-Debug-Image": "Use /debug to fetch the annotated image"})
+            "results": results,
+            "debug_image": f"/debug/{os.path.basename(debug_img_path)}"
+        })
 
     except Exception as e:
         return JSONResponse(content={"error": str(e)}, status_code=500)
-
-@app.get("/debug")
-async def get_debug():
-    return FileResponse("debug.png")
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=10000)
