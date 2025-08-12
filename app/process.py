@@ -5,7 +5,6 @@ import joblib
 from PIL import Image, ImageDraw, ImageFont
 import tensorflow as tf
 
-# Model config
 MODEL_DIR = os.path.join(os.getcwd(), "models")
 PARAM_ORDER = ["Nitrate", "Nitrite", "Chlorine", "Hardness", "Carbonate", "pH"]
 
@@ -16,7 +15,7 @@ def _find_file_for_param(param, ext_list):
             return os.path.join(MODEL_DIR, f)
     return None
 
-# Load models & scalers (robust)
+# Load models & scalers
 models = {}
 scalers = {}
 for p in PARAM_ORDER:
@@ -30,7 +29,6 @@ for p in PARAM_ORDER:
             print(f"Failed to load model for {p}: {e}")
             models[p] = None
     else:
-        print(f"No model file found for {p}")
         models[p] = None
 
     if sfile:
@@ -38,70 +36,28 @@ for p in PARAM_ORDER:
             scalers[p] = joblib.load(sfile)
             print(f"Loaded scaler for {p}: {os.path.basename(sfile)}")
         except Exception as e:
-            print(f"Failed to load scaler for {p}: {e}")
             scalers[p] = None
     else:
         scalers[p] = None
 
-# Image processing settings
 IMG_SIZE = (128, 128)
-MIN_AREA_RATIO = 0.0002  # relative area threshold for detection
 
 def preprocess_for_model_cv(img_bgr):
     img = cv2.resize(img_bgr, IMG_SIZE)
     arr = img.astype("float32") / 255.0
     return np.expand_dims(arr, axis=0)
 
-
 def find_color_patches(img_bgr, expected_pads=len(PARAM_ORDER)):
-    """Try robust color-patch detection; fallback to equal vertical splits."""
+    """
+    Use a simpler fixed-split method matching training setup
+    to ensure consistent crops in deployment.
+    """
     h, w = img_bgr.shape[:2]
-    blur = cv2.GaussianBlur(img_bgr, (5, 5), 0)
-    hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
-    s = hsv[:, :, 1]
-    v = hsv[:, :, 2]
-
-    # adaptive saturation threshold (handles pale colors)
-    median_s = np.median(s)
-    sat_thresh = max(12, int(median_s * 0.5))
-
-    sat_mask = (s > sat_thresh).astype("uint8") * 255
-    val_mask = (v < 250).astype("uint8") * 255
-
-    # also include non-white via L channel in LAB (handles desaturated patches)
-    lab = cv2.cvtColor(blur, cv2.COLOR_BGR2LAB)
-    l = lab[:, :, 0]
-    nonwhite = (l < 245).astype("uint8") * 255
-
-    mask = cv2.bitwise_or(cv2.bitwise_and(sat_mask, val_mask), nonwhite)
-
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    boxes = []
-    for cnt in contours:
-        x, y, ww, hh = cv2.boundingRect(cnt)
-        if ww * hh < (w * h) * MIN_AREA_RATIO:
-            continue
-        # shape filter
-        aspect = ww / float(hh) if hh > 0 else 0
-        if aspect < 0.3 or aspect > 3.5:
-            continue
-        boxes.append((x, y, ww, hh))
-
-    boxes = sorted(boxes, key=lambda b: b[0])
-
-    # if detection doesn't match expected pads, fallback to equal vertical splits
-    if len(boxes) != expected_pads:
-        box_w = w // expected_pads
-        boxes = [(i * box_w, 0, box_w, h) for i in range(expected_pads)]
-
+    box_w = w // expected_pads
+    boxes = [(i * box_w, 0, box_w, h) for i in range(expected_pads)]
     return boxes
 
-
-def tight_crop(img, x, y, w, h, pad_h_ratio=0.5, pad_w_ratio=0.2):
+def tight_crop(img, x, y, w, h, pad_h_ratio=0.2, pad_w_ratio=0.1):
     pad_h = int(h * pad_h_ratio)
     pad_w = int(w * pad_w_ratio)
     x1 = max(0, x - pad_w)
@@ -109,7 +65,6 @@ def tight_crop(img, x, y, w, h, pad_h_ratio=0.5, pad_w_ratio=0.2):
     x2 = min(img.shape[1], x + w + pad_w)
     y2 = min(img.shape[0], y + h + pad_h)
     return img[y1:y2, x1:x2]
-
 
 def classify_status(param, value):
     if value is None:
@@ -127,16 +82,13 @@ def classify_status(param, value):
         if v < 300:
             return "caution"
         return "danger"
-    # generic ppm thresholds
     if v <= 1:
         return "safe"
     if v <= 5:
         return "caution"
     return "danger"
 
-
 def predict_from_pil_image(pil_img):
-    """Full pipeline: detect, predict, annotate; returns (results_dict, debug_pil_image)."""
     img_np = np.array(pil_img)
     img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
     boxes = find_color_patches(img_bgr, expected_pads=len(PARAM_ORDER))
@@ -162,15 +114,13 @@ def predict_from_pil_image(pil_img):
                 inp = preprocess_for_model_cv(crop)
                 pred_scaled = float(model.predict(inp, verbose=0)[0][0])
 
-                # Heuristic: if predicted value looks like a normalized value (0..1),
-                # apply inverse_transform. If not, assume model outputs original scale already.
-                if scaler is not None and -0.05 <= pred_scaled <= 1.05:
+                if scaler is not None:
                     try:
                         pred_val = float(scaler.inverse_transform([[pred_scaled]])[0][0])
                     except Exception:
-                        pred_val = float(pred_scaled)
+                        pred_val = pred_scaled
                 else:
-                    pred_val = float(pred_scaled)
+                    pred_val = pred_scaled
             except Exception as e:
                 print(f"Prediction failed for {param}: {e}")
                 pred_val = None
@@ -182,7 +132,7 @@ def predict_from_pil_image(pil_img):
             "safety": classify_status(param, pred_val)
         }
 
-        # draw rectangle + text on PIL image
+        # draw rectangle + label
         draw.rectangle([(x, y), (x + ww, y + hh)], outline="lime", width=2)
         label = f"{param}: {results[key]['value']}"
         draw.text((x, max(0, y - 12)), label, fill="red", font=font)
